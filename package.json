@@ -1,0 +1,12 @@
+{
+  "name": "cyberstrike-server",
+  "version": "1.11.0",
+  "description": "Lobby and relay server for CyberStrike: Tactical Ops online matches",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
