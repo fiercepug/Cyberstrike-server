@@ -15,6 +15,7 @@
 //                     join|code   leave   handoff   away|0/1   start   end   to|id|payload   all|payload   ping|t
 //                     auth|token   logout   st|kills|deaths|wins|matches|secs   sv|save   lb|kills/secs
 //                     prof|name   flist   fadd|name   facc|name   fdec|name   frem|name   inv|name
+//                     ac|kind|detail (the game's anti-cheat flagged something)   kick|id|reason (host only)
 //   server -> client: welcome|id   lobbies|entries   joined|code|hostId|mode|max|public|name
 //                     roster|hostId|id:name;id:name   started   ended   m|fromId|payload
 //                     err|text   closed|reason   pong|t
@@ -25,7 +26,12 @@
 //                     fnote|text   invd|fromName|code|mode|lobbyName
 //
 // Environment: PORT, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OWNER (your username: gets
-// the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests).
+// the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests),
+// ADMIN_KEY (a password for POST /api/admin/unflag, which puts a wrongly flagged account back on the boards).
+//
+// Anti-cheat: stats reports are checked against the clock and against what a person can do; the game
+// reports matches its own anti-cheat flagged (ac|...). An account with AC_LIMIT strikes is flagged:
+// it keeps playing but leaves the leaderboards.
 
 'use strict';
 const http = require('http');
@@ -38,6 +44,8 @@ const MODES = { duel: 2, dm: 10, casual: 10 };
 const MAX_LOBBIES = 500;
 const MAX_MSG = 64 * 1024;
 const OWNER = String(process.env.OWNER || '').trim().replace(/^@/, '').toLowerCase();
+const ADMIN_KEY = String(process.env.ADMIN_KEY || '');
+const AC_LIMIT = 3;
 
 let nextId = 1;
 const lobbies = new Map();          // code -> lobby
@@ -413,6 +421,7 @@ async function attach(c, token) {
     if (!u) {
       u = { uid, name: o.name, conns: new Set(), friends: new Set(fr || []), reqs: new Set(rq || []), base: {}, pend: {}, save: save || '', saveDirty: false, saveAt: 0, lastFlush: Date.now() };
       for (const k of STAT_KEYS) u.base[k] = parseInt(o[k] || '0', 10) || 0;
+      u.acFlags = parseInt(o.acflags || '0', 10) || 0; u.flagged = o.flagged === '1';
       users.set(uid, u);
     }
     nameCache.set(uid, o.name);
@@ -449,8 +458,8 @@ async function flushUser(u) {
   const p = u.pend, cmds = [];
   const delta = {};
   for (const k of STAT_KEYS) { delta[k] = Math.floor(p[k] || 0); if (delta[k] > 0) cmds.push(['HINCRBY', K.user(u.uid), k, delta[k]]); }
-  if (delta.kills > 0) cmds.push(['ZINCRBY', K.lb('kills'), delta.kills, u.uid]);
-  if (delta.secs > 0) cmds.push(['ZINCRBY', K.lb('secs'), delta.secs, u.uid]);
+  if (delta.kills > 0 && !u.flagged) cmds.push(['ZINCRBY', K.lb('kills'), delta.kills, u.uid]);
+  if (delta.secs > 0 && !u.flagged) cmds.push(['ZINCRBY', K.lb('secs'), delta.secs, u.uid]);
   const saveNow = u.saveDirty ? u.save : null;
   if (saveNow !== null) cmds.push(['SET', K.save(u.uid), saveNow]);
   if (!cmds.length) return;
@@ -484,15 +493,51 @@ function addStats(c, f) {
   c.statClock = now;
   const v = f.slice(0, 5).map((x) => Math.max(0, parseInt(x, 10) || 0));
   let [kills, deaths, wins, matches, secs] = v;
+  const asked = { kills, secs, matches };
   secs = Math.min(secs, elapsed);
-  kills = Math.min(kills, 3 + Math.ceil(secs));
+  kills = Math.min(kills, 2 + Math.ceil(secs * 0.4));       // 24 kills a minute is already far past anyone real
   deaths = Math.min(deaths, 3 + Math.ceil(secs / 2));
   matches = Math.min(matches, 1 + Math.floor(secs / 30));
   wins = Math.min(wins, matches);
+  // a report that is impossible on its own terms (not just early after a reconnect) is a strike
+  if (asked.kills > 2 + asked.secs * 0.5 || asked.matches > 1 + asked.secs / 30 || v[2] > v[3])
+    acStrike(c, u, 'stats', 'impossible stats report ' + v.join('/'));
   const add = { kills, deaths, wins, matches, secs };
   for (const k of STAT_KEYS) u.pend[k] = (u.pend[k] || 0) + add[k];
   if (matches > 0) flushUser(u).catch((e) => console.error('flush', e.message));    // a match ended: save now
   sendUser(u, meMsg(u));
+}
+
+// anti-cheat strikes: the game flagged a match / edited memory / edited saves, or sent impossible stats.
+// At most one strike per connection per minute; AC_LIMIT strikes take the account off the leaderboards.
+function acStrike(c, u, kind, detail) {
+  const now = Date.now();
+  if (c.acAt && now - c.acAt < 60000) return;
+  c.acAt = now;
+  u.acFlags = (u.acFlags || 0) + 1;
+  console.log('anti-cheat: ' + u.name + ' ' + kind + ' (' + clean(detail, 100) + '), strike ' + u.acFlags);
+  const cmds = [['HINCRBY', K.user(u.uid), 'acflags', 1]];
+  if (u.acFlags >= AC_LIMIT && !u.flagged) {
+    u.flagged = true;
+    cmds.push(['HSET', K.user(u.uid), 'flagged', '1'], ['ZREM', K.lb('kills'), u.uid], ['ZREM', K.lb('secs'), u.uid]);
+    lbCache.clear();
+    console.log('anti-cheat: ' + u.name + ' flagged, removed from the leaderboards');
+  }
+  db(cmds).catch((e) => console.error('acStrike', e.message));
+}
+
+async function adminUnflag(body) {
+  if (!ADMIN_KEY || String(body.key || '') !== ADMIN_KEY) throw new UserError('Not allowed.');
+  const uid = await uidByName(body.username);
+  if (!uid) throw new UserError('No such player.');
+  const o = hashOf(await db1(['HGETALL', K.user(uid)]));
+  const u = users.get(uid);
+  const kills = (parseInt(o.kills || '0', 10) || 0), secs = (parseInt(o.secs || '0', 10) || 0);
+  await db([['HSET', K.user(uid), 'flagged', '0', 'acflags', 0], ['ZREM', K.lb('kills'), uid], ['ZREM', K.lb('secs'), uid],
+            ['ZINCRBY', K.lb('kills'), kills, uid], ['ZINCRBY', K.lb('secs'), secs, uid]]);
+  if (u) { u.flagged = false; u.acFlags = 0; }
+  lbCache.clear();
+  return { name: o.name, kills, secs };
 }
 
 // leaderboards: top 50, cached for 30 seconds
@@ -708,6 +753,7 @@ function handle(c, msg) {
       const lb = lobbies.get(code);
       if (!lb) { send(c, 'err|No lobby with that code'); break; }
       if (lb.members.includes(c.id)) break;
+      if (lb.banned && (lb.banned.has(c.id) || (c.uid && lb.banned.has('u' + c.uid)))) { send(c, 'err|You were removed from that lobby'); break; }
       if (lb.started) { send(c, 'err|That match has already started'); break; }
       if (lb.members.length >= lb.max) { send(c, 'err|That lobby is full'); break; }
       if (l) leaveLobby(c);
@@ -778,6 +824,23 @@ function handle(c, msg) {
     case 'st':
       if (c.uid) addStats(c, f);
       break;
+
+    case 'ac': {                    // the game's anti-cheat: ac|match|why, ac|mem|what, ac|save|...
+      const u = c.uid ? users.get(c.uid) : null;
+      if (u && ['match', 'mem', 'save'].includes(f[0])) acStrike(c, u, f[0], f[1] || '');
+      break;
+    }
+
+    case 'kick': {                  // host: the anti-cheat removed a player from the match
+      if (!l || l.host !== c.id) break;
+      const tid = parseInt(f[0], 10), tc = clients.get(tid);
+      if (!tc || tc === c || tc.lobby !== l.code) break;
+      l.banned = l.banned || new Set();
+      l.banned.add(tid); if (tc.uid) l.banned.add('u' + tc.uid);
+      send(tc, 'closed|Removed from the match by the anti-cheat' + (clean(f[1], 80) ? ': ' + clean(f[1], 80) : ''));
+      leaveLobby(tc, 'kicked');
+      break;
+    }
 
     case 'sv': {
       const u = c.uid ? users.get(c.uid) : null;
@@ -925,6 +988,7 @@ const server = http.createServer(async (req, res) => {
       else if (url === '/api/login') reply(res, 200, Object.assign({ ok: true }, await login(ip, body.email, body.password)));
       else if (url === '/api/delete') reply(res, 200, Object.assign({ ok: true }, await deleteAccount(ip, body.email, body.password)));
       else if (url === '/api/logout') { if (body.token) await db1(['DEL', K.sess(hashToken(body.token))]); reply(res, 200, { ok: true }); }
+      else if (url === '/api/admin/unflag') reply(res, 200, Object.assign({ ok: true }, await adminUnflag(body)));
       else reply(res, 404, { error: 'Not found.' });
     } catch (e) {
       if (e instanceof UserError) reply(res, 400, { error: e.message });
