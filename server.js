@@ -632,7 +632,7 @@ const PROFILE_KEY = 'cyberstrike_profile_v1';
 const ECO_RATE = 3;              // the allowance grows by this many credits per second of real time (a top player earns 1-3/s)
 const ECO_BUCKET = 6000;         // the most allowance that builds up (a run of quick matches, or playing while the server was away)
 const ECO_SLACK = 60;
-const ECO_IMPORT_CAP = 40000;    // credits plus skin value a new account (or one from before this check) may bring in (one lucky knife fits)
+const ECO_IMPORT_CAP = 40000;    // credits plus skin value an account from before this check may keep (one lucky knife fits); new accounts start fresh
 const ECO_STRIKE = 5000;         // a refused save this far over is also an anti-cheat strike
 const WEAR_MUL = [1.25, 1.10, 1.0, 0.90, 0.80].map(Math.fround);
 const WEAR_EDGE = [0.07, 0.15, 0.38, 0.45].map(Math.fround);
@@ -743,8 +743,9 @@ function ecoCheck(u, blob) {
   const now = Date.now();
   const e = parseEco(blob);
   if (!u.eco) {
-    const why = importOk(e);
-    if (why) return { ok: false, why, strike: false, reset: true };
+    // a new account's first save: it starts like a new player. Guest progress only ever lived in that browser, where
+    // anyone can edit it, so none of it comes in (the game keeps it on the device for when they play as a guest).
+    if (e.items.size > 0 || e.credits > ECO.startCredits) return { ok: false, why: 'a new account starts fresh, guest progress stays with the guest', strike: false, reset: true };
     u.eco = freshEco(e, now, ECO_BUCKET); u.ecoDirty = true;
     return { ok: true };
   }
@@ -1114,7 +1115,7 @@ function handle(c, msg) {
       const r = ecoCheck(u, rest);
       if (r.ok) { u.save = rest; if (!u.saveDirty) u.saveAt = Date.now(); u.saveDirty = true; break; }
       console.log('economy: refused a save from ' + u.name + ': ' + r.why + (r.detail ? ' (' + r.detail + ')' : ''));
-      if (r.reset) {                 // a new account bringing in more than can be checked: it starts with a new player's credits and skins
+      if (r.reset) {                 // a new account's first save had guest progress in it: it starts with a new player's credits and skins (settings kept)
         u.save = resetEconomy(rest); u.saveDirty = true; u.saveAt = 0;
         u.eco = freshEco(parseEco(u.save), Date.now(), ECO_BUCKET); u.ecoDirty = true;
       }
