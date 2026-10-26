@@ -21,6 +21,7 @@
 //                     err|text   closed|reason   pong|t
 //                     me|name|owner|kills|deaths|wins|matches|secs   autherr|text   save|data
 //                     svx|reason|data (a save was refused: data is the last good save)
+//                     staff|owner/tester/(empty) (after logging in: whether the account gets the owner panel)
 //                     lbd|board|myRank|myValue|name,value,owner;...
 //                     profd|name|owner|kills|deaths|wins|matches|secs|status|mode|friend|kRank|hRank
 //                     fl|requests(name,name)|friends(name:status:mode:code:owner;...)
@@ -29,6 +30,7 @@
 // Environment: PORT, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OWNER (your username: gets
 // the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests),
 // ADMIN_KEY (a password for POST /api/admin/unflag, which puts a wrongly flagged account back on the boards),
+// STAFF (optional, replaces the built-in list fiercepug6:owner,PRO:tester): accounts that get the owner panel,
 // email verification (optional): MAIL_FROM ("CyberStrike <you@gmail.com>") plus BREVO_API_KEY or RESEND_API_KEY.
 //   With them set, new accounts get a 6-digit code by email and must enter it before they can log in.
 //   Without them, sign-up works without verification (as before).
@@ -268,6 +270,21 @@ async function checkPassword(pw, stored) {
 }
 function validEmail(e) { return e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 function isOwner(name) { return !!OWNER && String(name).toLowerCase() === OWNER; }
+// Staff accounts get the owner panel in the game: 'owner' = everything, 'tester' = bug tools, credits and skins.
+// Their saves skip the economy check (the panel gives credits and skins) and they're kept off the credits leaderboard.
+// STAFF (env) replaces the list: "name:owner,name:tester".
+const STAFF = (() => {
+  const m = new Map([['fiercepug6', 'owner'], ['pro', 'tester']]);
+  if (process.env.STAFF !== undefined) {
+    m.clear();
+    for (const part of String(process.env.STAFF).split(',')) {
+      const [n, r] = part.split(':').map((x) => String(x || '').trim());
+      if (n && (r === 'owner' || r === 'tester')) m.set(n.replace(/^@/, '').toLowerCase(), r);
+    }
+  }
+  return m;
+})();
+function staffRole(name) { return STAFF.get(String(name || '').toLowerCase()) || ''; }
 
 // failed logins / sign-ups per IP and per account, kept in memory
 const limits = new Map();
@@ -539,6 +556,8 @@ async function attach(c, token) {
   u.conns.add(c);
   c.name = u.name;
   send(c, meMsg(u));
+  send(c, 'staff|' + staffRole(u.name));
+  if (staffRole(u.name) && !u.staffLb) { u.staffLb = true; db1(['ZREM', K.lb('credits'), uid]).then(() => lbCache.clear()).catch(() => {}); }
   send(c, 'save|' + (u.save || ''));
   send(c, flMsg(u));
   const l = lobbyOf(c);
@@ -572,7 +591,7 @@ async function flushUser(u) {
   const ecoNow = u.ecoDirty && u.eco ? ecoState(u) : null;
   if (ecoNow !== null) {
     cmds.push(['HSET', K.user(u.uid), 'eco', ecoNow]);
-    if (!u.flagged) cmds.push(['ZADD', K.lb('credits'), u.eco.credits, u.uid]);
+    if (!u.flagged && !staffRole(u.name)) cmds.push(['ZADD', K.lb('credits'), u.eco.credits, u.uid]);
   }
   if (!cmds.length) return;
   // move what we're writing out of "pending" first, so new reports during the write aren't lost
@@ -722,6 +741,7 @@ function importOk(e) {
 function ecoLoad(u, stateJson) {
   if (!u.save) { u.eco = null; return; }               // a new account: its first save is checked as an import
   const now = Date.now();
+  if (staffRole(u.name)) { u.eco = freshEco(parseEco(u.save), now, ECO_BUCKET); u.ecoDirty = true; return; }   // staff: not checked
   let st = null;
   try { st = stateJson ? JSON.parse(stateJson) : null; } catch (e) { st = null; }
   const e = parseEco(u.save);
@@ -742,6 +762,7 @@ function ecoLoad(u, stateJson) {
 function ecoCheck(u, blob) {
   const now = Date.now();
   const e = parseEco(blob);
+  if (staffRole(u.name)) { u.eco = freshEco(e, now, ECO_BUCKET); u.ecoDirty = true; return { ok: true }; }    // staff: the panel gives credits and skins
   if (!u.eco) {
     // a new account's first save: it starts like a new player. Guest progress only ever lived in that browser, where
     // anyone can edit it, so none of it comes in (the game keeps it on the device for when they play as a guest).
@@ -801,7 +822,7 @@ async function adminUnflag(body) {
   const kills = (parseInt(o.kills || '0', 10) || 0), secs = (parseInt(o.secs || '0', 10) || 0);
   const credits = u && u.eco ? u.eco.credits : parseEco(await db1(['GET', K.save(uid)]) || '').credits;
   await db([['HSET', K.user(uid), 'flagged', '0', 'acflags', 0], ['ZREM', K.lb('kills'), uid], ['ZREM', K.lb('secs'), uid],
-            ['ZINCRBY', K.lb('kills'), kills, uid], ['ZINCRBY', K.lb('secs'), secs, uid], ['ZADD', K.lb('credits'), credits, uid]]);
+            ['ZINCRBY', K.lb('kills'), kills, uid], ['ZINCRBY', K.lb('secs'), secs, uid]].concat(staffRole(o.name) ? [] : [['ZADD', K.lb('credits'), credits, uid]]));
   if (u) { u.flagged = false; u.acFlags = 0; }
   lbCache.clear();
   return { name: o.name, kills, secs };
