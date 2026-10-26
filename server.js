@@ -13,13 +13,14 @@
 // Protocol: one text message per WebSocket frame, fields separated by '|'.
 //   client -> server: hello|ver|name   list   create|code|public|mode|max|lobbyName
 //                     join|code   leave   handoff   away|0/1   start   end   to|id|payload   all|payload   ping|t
-//                     auth|token   logout   st|kills|deaths|wins|matches|secs   sv|save   lb|kills/secs
+//                     auth|token   logout   st|kills|deaths|wins|matches|secs   sv|save   lb|kills/secs/credits
 //                     prof|name   flist   fadd|name   facc|name   fdec|name   frem|name   inv|name
 //                     ac|kind|detail (the game's anti-cheat flagged something)   kick|id|reason (host only)
 //   server -> client: welcome|id   lobbies|entries   joined|code|hostId|mode|max|public|name
 //                     roster|hostId|id:name;id:name   started   ended   m|fromId|payload
 //                     err|text   closed|reason   pong|t
 //                     me|name|owner|kills|deaths|wins|matches|secs   autherr|text   save|data
+//                     svx|reason|data (a save was refused: data is the last good save)
 //                     lbd|board|myRank|myValue|name,value,owner;...
 //                     profd|name|owner|kills|deaths|wins|matches|secs|status|mode|friend|kRank|hRank
 //                     fl|requests(name,name)|friends(name:status:mode:code:owner;...)
@@ -27,11 +28,19 @@
 //
 // Environment: PORT, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OWNER (your username: gets
 // the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests),
-// ADMIN_KEY (a password for POST /api/admin/unflag, which puts a wrongly flagged account back on the boards).
+// ADMIN_KEY (a password for POST /api/admin/unflag, which puts a wrongly flagged account back on the boards),
+// email verification (optional): MAIL_FROM ("CyberStrike <you@gmail.com>") plus BREVO_API_KEY or RESEND_API_KEY.
+//   With them set, new accounts get a 6-digit code by email and must enter it before they can log in.
+//   Without them, sign-up works without verification (as before).
 //
 // Anti-cheat: stats reports are checked against the clock and against what a person can do; the game
 // reports matches its own anti-cheat flagged (ac|...). An account with AC_LIMIT strikes is flagged:
 // it keeps playing but leaves the leaderboards.
+//
+// Economy check: every cloud save is compared with the last accepted one. New credits, plus the price of the
+// cases behind any new skins, minus what sold skins were worth, must fit what can be earned by playing in the
+// time that passed. Saves that don't fit (credits or skins added from outside the game) are refused and the
+// game gets the last good save back.
 
 'use strict';
 const http = require('http');
@@ -105,14 +114,14 @@ class MemRedis {
     switch (cmd) {
       case 'GET': return this.str.has(k) ? this.str.get(k) : null;
       case 'SET': {
-        let nx = false, ex = 0;
+        let nx = false, ex = 0, keep = false;
         for (let i = 3; i < a.length; i++) {
           const o = String(a[i]).toUpperCase();
-          if (o === 'NX') nx = true; else if (o === 'EX') ex = parseInt(a[++i], 10);
+          if (o === 'NX') nx = true; else if (o === 'EX') ex = parseInt(a[++i], 10); else if (o === 'KEEPTTL') keep = true;
         }
         if (nx && this.str.has(k)) return null;
         this.str.set(k, String(a[2]));
-        if (ex > 0) this.exp.set(k, Date.now() + ex * 1000); else this.exp.delete(k);
+        if (ex > 0) this.exp.set(k, Date.now() + ex * 1000); else if (!keep) this.exp.delete(k);
         return write('OK');
       }
       case 'DEL': {
@@ -164,6 +173,10 @@ class MemRedis {
         let z = this.zset.get(k); if (!z) { z = new Map(); this.zset.set(k, z); }
         const v = (z.get(String(a[3])) || 0) + parseFloat(a[2]);
         z.set(String(a[3]), v); return write(num(v));
+      }
+      case 'ZADD': {
+        let z = this.zset.get(k); if (!z) { z = new Map(); this.zset.set(k, z); }
+        const had = z.has(String(a[3])); z.set(String(a[3]), parseFloat(a[2])); return write(had ? 0 : 1);
       }
       case 'ZREM': {
         const z = this.zset.get(k); if (!z) return 0;
@@ -226,7 +239,7 @@ async function db1(cmd) { return (await db([cmd]))[0]; }
 const K = {
   uid: 'cs:uid', email: (e) => 'cs:email:' + e, uname: (n) => 'cs:uname:' + n, user: (u) => 'cs:user:' + u,
   names: 'cs:names', sess: (h) => 'cs:sess:' + h, fr: (u) => 'cs:fr:' + u, rq: (u) => 'cs:rq:' + u,
-  save: (u) => 'cs:save:' + u, lb: (b) => 'cs:lb:' + b,
+  save: (u) => 'cs:save:' + u, lb: (b) => 'cs:lb:' + b, vcode: (u) => 'cs:vcode:' + u,
 };
 
 //==========================================================================================
@@ -276,6 +289,93 @@ async function newSession(uid) {
   return token;
 }
 
+// ---- email verification (only when a mail service is configured)
+const MAIL_FROM = String(process.env.MAIL_FROM || '').trim();
+const BREVO_KEY = String(process.env.BREVO_API_KEY || '').trim();
+const RESEND_KEY = String(process.env.RESEND_API_KEY || '').trim();
+const mailOn = !!(MAIL_FROM && (BREVO_KEY || RESEND_KEY));
+const CODE_MINUTES = 30, CODE_TRIES = 5, RESEND_SECONDS = 60;
+function mailFrom() {
+  const m = /^\s*(.*?)\s*<\s*([^>]+)\s*>\s*$/.exec(MAIL_FROM);
+  return m ? { name: m[1].replace(/^"|"$/g, '') || 'CyberStrike', email: m[2] } : { name: 'CyberStrike', email: MAIL_FROM };
+}
+async function sendMail(to, subject, text, html) {
+  const from = mailFrom();
+  let res;
+  if (BREVO_KEY) {
+    res = await fetch(process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email', {
+      method: 'POST', headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ sender: from, to: [{ email: to }], subject, textContent: text, htmlContent: html }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } else {
+    res = await fetch('https://api.resend.com/emails', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + RESEND_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: from.name + ' <' + from.email + '>', to: [to], subject, text, html }),
+      signal: AbortSignal.timeout(10000),
+    });
+  }
+  if (!res.ok) throw new Error('mail service HTTP ' + res.status + ' ' + (await res.text().catch(() => '')).slice(0, 200));
+}
+async function sendCode(uid, email, name) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  await db([['SET', K.vcode(uid), JSON.stringify({ h: hashToken(code), n: 0 }), 'EX', CODE_MINUTES * 60],
+    ['HSET', K.user(uid), 'vsent', Date.now()]]);
+  const text = 'Hi ' + name + ',\n\nYour CyberStrike verification code is ' + code + '\n\nEnter it in the game to finish creating your account. ' +
+    'It works for ' + CODE_MINUTES + ' minutes.\n\nIf you didn\'t sign up for CyberStrike, you can ignore this email.';
+  const html = '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:15px;color:#222">' +
+    '<p>Hi ' + name + ',</p><p>Your CyberStrike verification code is</p>' +
+    '<p style="font-size:30px;font-weight:700;letter-spacing:6px;margin:8px 0 16px">' + code + '</p>' +
+    '<p>Enter it in the game to finish creating your account. It works for ' + CODE_MINUTES + ' minutes.</p>' +
+    '<p style="color:#888;font-size:13px">If you didn\'t sign up for CyberStrike, you can ignore this email.</p></div>';
+  try { await sendMail(email, 'Your CyberStrike code: ' + code, text, html); }
+  catch (e) { console.error('verification email to ' + email + ' failed: ' + e.message); throw new UserError("We couldn't send the email right now. Try again in a minute."); }
+}
+// a not yet verified account: send a fresh code unless one went out a moment ago
+async function needVerify(uid, user) {
+  const last = parseInt(user.vsent || '0', 10) || 0;
+  if (Date.now() - last > RESEND_SECONDS * 1000) await sendCode(uid, user.email, user.name);
+  return { needVerify: true, email: user.email };
+}
+async function uidByIdent(ident) {
+  ident = String(ident || '').trim().replace(/^@/, '').toLowerCase();
+  if (!ident) return null;
+  return await db1(['GET', ident.includes('@') ? K.email(ident) : K.uname(ident)]);
+}
+async function verifyCode(ip, ident, code) {
+  code = String(code || '').replace(/\D/g, '');
+  if (code.length !== 6) throw new UserError('Enter the 6-digit code from the email.');
+  if (limited('vf:' + ip, 20)) throw new UserError('Too many tries. Wait 15 minutes and try again.');
+  const uid = await uidByIdent(ident);
+  const user = uid ? hashOf(await db1(['HGETALL', K.user(uid)])) : null;
+  if (!user) throw new UserError('That account no longer exists. Create it again.');
+  if (user.verified !== '0') return { token: await newSession(uid), name: user.name };
+  const raw = await db1(['GET', K.vcode(uid)]);
+  let st = null; try { st = raw ? JSON.parse(raw) : null; } catch (e) { st = null; }
+  if (!st) throw new UserError('That code has expired. Tap "Send a new code".');
+  if (st.n >= CODE_TRIES) throw new UserError('Too many wrong codes. Tap "Send a new code".');
+  if (st.h !== hashToken(code)) {
+    bump('vf:' + ip, 15 * 60 * 1000);
+    st.n++;
+    await db1(['SET', K.vcode(uid), JSON.stringify(st), 'KEEPTTL']);
+    throw new UserError(st.n >= CODE_TRIES ? 'Too many wrong codes. Tap "Send a new code".' : "That code isn't right. Check the email and try again.");
+  }
+  await db([['HSET', K.user(uid), 'verified', '1'], ['DEL', K.vcode(uid)]]);
+  return { token: await newSession(uid), name: user.name };
+}
+async function resendCode(ip, ident) {
+  if (limited('rs:' + ip, 6)) throw new UserError('Too many emails. Wait a while and try again.');
+  const uid = await uidByIdent(ident);
+  const user = uid ? hashOf(await db1(['HGETALL', K.user(uid)])) : null;
+  if (!user || user.verified !== '0') throw new UserError('Nothing to verify. Log in instead.');
+  const last = parseInt(user.vsent || '0', 10) || 0;
+  const wait = Math.ceil((RESEND_SECONDS * 1000 - (Date.now() - last)) / 1000);
+  if (wait > 0) throw new UserError('Wait ' + wait + ' seconds before asking for another code.');
+  bump('rs:' + ip, 3600 * 1000);
+  await sendCode(uid, user.email, user.name);
+  return { sent: true, email: user.email };
+}
+
 async function signup(ip, email, password, name) {
   email = String(email || '').trim().toLowerCase();
   name = String(name || '').trim().replace(/^@/, '');
@@ -298,6 +398,11 @@ async function signup(ip, email, password, name) {
     ['HSET', K.names, uid, name],
   ]);
   bump('su:' + ip, 3600 * 1000);
+  if (mailOn) {                      // the account works once the code from the email is entered
+    await db1(['HSET', K.user(uid), 'verified', '0']);
+    try { await sendCode(uid, email, name); } catch (e) { /* they can ask for a new code on the next screen */ }
+    return { needVerify: true, email, name };
+  }
   return { token: await newSession(uid), name };
 }
 
@@ -312,6 +417,7 @@ async function login(ip, ident, password) {
     bump('li:' + ip, 15 * 60 * 1000); bump('la:' + ident, 15 * 60 * 1000);
     throw new UserError('Wrong email or password.');
   }
+  if (user.verified === '0' && mailOn) return await needVerify(uid, user);      // signed up but never entered the emailed code
   return { token: await newSession(uid), name: user.name };
 }
 
@@ -332,8 +438,8 @@ async function deleteAccount(ip, ident, password) {
   if (u) u.deleted = true;
   const fr = await db1(['SMEMBERS', K.fr(id)]) || [];
   const cmds = fr.map((f) => ['SREM', K.fr(f), id]);
-  cmds.push(['DEL', K.user(id), K.email(user.email), K.uname(String(user.name).toLowerCase()), K.save(id), K.fr(id), K.rq(id)],
-    ['HDEL', K.names, id], ['ZREM', K.lb('kills'), id], ['ZREM', K.lb('secs'), id]);
+  cmds.push(['DEL', K.user(id), K.email(user.email), K.uname(String(user.name).toLowerCase()), K.save(id), K.fr(id), K.rq(id), K.vcode(id)],
+    ['HDEL', K.names, id], ['ZREM', K.lb('kills'), id], ['ZREM', K.lb('secs'), id], ['ZREM', K.lb('credits'), id]);
   await db(cmds);
   nameCache.delete(id); lbCache.clear();
   for (const o of users.values()) {
@@ -422,6 +528,7 @@ async function attach(c, token) {
       u = { uid, name: o.name, conns: new Set(), friends: new Set(fr || []), reqs: new Set(rq || []), base: {}, pend: {}, save: save || '', saveDirty: false, saveAt: 0, lastFlush: Date.now() };
       for (const k of STAT_KEYS) u.base[k] = parseInt(o[k] || '0', 10) || 0;
       u.acFlags = parseInt(o.acflags || '0', 10) || 0; u.flagged = o.flagged === '1';
+      ecoLoad(u, o.eco);
       users.set(uid, u);
     }
     nameCache.set(uid, o.name);
@@ -462,24 +569,31 @@ async function flushUser(u) {
   if (delta.secs > 0 && !u.flagged) cmds.push(['ZINCRBY', K.lb('secs'), delta.secs, u.uid]);
   const saveNow = u.saveDirty ? u.save : null;
   if (saveNow !== null) cmds.push(['SET', K.save(u.uid), saveNow]);
+  const ecoNow = u.ecoDirty && u.eco ? ecoState(u) : null;
+  if (ecoNow !== null) {
+    cmds.push(['HSET', K.user(u.uid), 'eco', ecoNow]);
+    if (!u.flagged) cmds.push(['ZADD', K.lb('credits'), u.eco.credits, u.uid]);
+  }
   if (!cmds.length) return;
   // move what we're writing out of "pending" first, so new reports during the write aren't lost
   for (const k of STAT_KEYS) { p[k] = (p[k] || 0) - delta[k]; u.base[k] += delta[k]; }
   if (saveNow !== null) u.saveDirty = false;
+  if (ecoNow !== null) u.ecoDirty = false;
   u.lastFlush = Date.now();
   try { await db(cmds); }
   catch (e) {
     for (const k of STAT_KEYS) { p[k] = (p[k] || 0) + delta[k]; u.base[k] -= delta[k]; }
     if (saveNow !== null && !u.saveDirty) u.saveDirty = true;
+    if (ecoNow !== null) u.ecoDirty = true;
     throw e;
   }
-  if (delta.kills > 0 || delta.secs > 0) lbCache.clear();
+  if (delta.kills > 0 || delta.secs > 0 || ecoNow !== null) lbCache.clear();
 }
 setInterval(() => {
   const now = Date.now();
   for (const u of users.values()) {
     const statsDue = now - u.lastFlush > FLUSH_MS && STAT_KEYS.some((k) => (u.pend[k] || 0) >= 1);
-    const saveDue = u.saveDirty && now - u.saveAt > SAVE_FLUSH_MS;
+    const saveDue = (u.saveDirty || u.ecoDirty) && now - u.saveAt > SAVE_FLUSH_MS;
     if (statsDue || saveDue) flushUser(u).catch((e) => console.error('flush', e.message));
   }
 }, 15000).unref();
@@ -508,6 +622,157 @@ function addStats(c, f) {
   sendUser(u, meMsg(u));
 }
 
+//==========================================================================================
+// Economy check on cloud saves (anti-cheat): credits and skins can only come from playing
+//==========================================================================================
+// Copied from the game by running it with CS_ECODUMP=1 (EcoDump in main.cpp): skins are [case, rarity],
+// cases are [price, tier]. Update this when skins or cases are added to the game.
+const ECO = {"startCredits":500,"maxInv":400,"skins":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,1],[0,1],[0,1],[0,1],[0,2],[0,2],[0,2],[0,3],[0,3],[0,4],[0,4],[0,4],[0,4],[1,0],[1,0],[1,0],[1,0],[1,0],[1,1],[1,1],[1,1],[1,1],[1,2],[1,2],[1,2],[1,3],[1,3],[1,4],[1,4],[1,4],[1,4],[2,0],[2,0],[2,0],[2,0],[2,0],[2,1],[2,1],[2,1],[2,1],[2,2],[2,2],[2,2],[2,3],[2,3],[2,4],[2,4],[2,4],[2,4],[3,0],[3,0],[3,0],[3,0],[3,0],[3,1],[3,1],[3,1],[3,1],[3,2],[3,2],[3,2],[3,3],[3,3],[3,4],[3,4],[3,4],[3,4],[4,0],[4,0],[4,0],[4,0],[4,0],[4,1],[4,1],[4,1],[4,1],[4,2],[4,2],[4,2],[4,3],[4,3],[4,4],[4,4],[4,4],[4,4],[5,0],[5,0],[5,0],[5,0],[5,0],[5,1],[5,1],[5,1],[5,1],[5,2],[5,2],[5,2],[5,3],[5,3],[5,4],[5,4],[5,4],[5,4],[6,0],[6,0],[6,0],[6,0],[6,0],[6,1],[6,1],[6,1],[6,1],[6,2],[6,2],[6,2],[6,3],[6,3],[6,4],[6,4],[6,4],[6,4],[7,0],[7,0],[7,0],[7,0],[7,0],[7,1],[7,1],[7,1],[7,1],[7,2],[7,2],[7,2],[7,3],[7,3],[7,4],[7,4],[7,4],[7,4],[8,0],[8,0],[8,0],[8,0],[8,0],[8,1],[8,1],[8,1],[8,1],[8,2],[8,2],[8,2],[8,3],[8,3],[8,4],[8,4],[8,4],[8,4],[9,0],[9,0],[9,0],[9,0],[9,0],[9,1],[9,1],[9,1],[9,1],[9,2],[9,2],[9,2],[9,3],[9,3],[9,4],[9,4],[9,4],[9,4]],"cases":[[100,0],[250,1],[250,1],[250,1],[500,2],[500,2],[1000,3],[1000,3],[2000,4],[4000,5]],"tierValue":[0.5,1,1.60000002,2.5,4,7],"rarityValue":[30,100,300,900,2400],"tierOdds":[[84,13,2.4000001,0.449999988,0.150000006],[79.9199982,15.9799995,3.20000005,0.639999986,0.25999999],[72,19.5,6,1.79999995,0.699999988],[60,25,10,3.5999999,1.39999998],[45,30,16,6.5,2.5],[25,33,25,12,5]]};
+const PROFILE_KEY = 'cyberstrike_profile_v1';
+const ECO_RATE = 3;              // the allowance grows by this many credits per second of real time (a top player earns 1-3/s)
+const ECO_BUCKET = 6000;         // the most allowance that builds up (a run of quick matches, or playing while the server was away)
+const ECO_SLACK = 60;
+const ECO_IMPORT_CAP = 40000;    // credits plus skin value a new account (or one from before this check) may bring in (one lucky knife fits)
+const ECO_STRIKE = 5000;         // a refused save this far over is also an anti-cheat strike
+const WEAR_MUL = [1.25, 1.10, 1.0, 0.90, 0.80].map(Math.fround);
+const WEAR_EDGE = [0.07, 0.15, 0.38, 0.45].map(Math.fround);
+
+function wearIndex(w) { return w < WEAR_EDGE[0] ? 0 : (w < WEAR_EDGE[1] ? 1 : (w < WEAR_EDGE[2] ? 2 : (w < WEAR_EDGE[3] ? 3 : 4))); }
+function skinInfo(skin) {
+  const s = ECO.skins[skin];
+  const c = s ? ECO.cases[s[0]] : null;
+  return c ? { rarity: s[1], price: c[0], tier: c[1] } : null;
+}
+// what the game pays when a skin is sold (ItemValue in main.cpp, in the same float arithmetic)
+function itemValue(skin, wear) {
+  const s = skinInfo(skin);
+  if (!s) return 0;
+  return Math.trunc(Math.fround(Math.fround(ECO.rarityValue[s.rarity] * WEAR_MUL[wearIndex(wear)]) * Math.fround(ECO.tierValue[s.tier])));
+}
+function unescapeSave(v) { return String(v).replace(/\\(.)/g, (m, ch) => (ch === 'n' ? '\n' : (ch === 't' ? '\t' : ch))); }
+function escapeSave(v) { return String(v).replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\r/g, ''); }
+function saveFields(blob) { return String(blob || '').split('\t'); }    // rev, N, key, value, key, value...
+function profileOf(blob) {
+  const f = saveFields(blob);
+  for (let i = 2; i + 1 < f.length; i += 2) if (f[i] === PROFILE_KEY) return unescapeSave(f[i + 1]);
+  return '';
+}
+// credits and skins of a saved profile, read the way the game reads them (LoadProfile)
+function parseEco(blob) {
+  const e = { credits: ECO.startCredits, items: new Map(), n: 0 };
+  for (const line of profileOf(blob).split('\n')) {
+    let m;
+    if ((m = /^credits (-?\d+)/.exec(line))) e.credits = Math.max(0, parseInt(m[1], 10) || 0);
+    else if ((m = /^i (-?\d+) (-?\d+) (\S+)/.exec(line))) {
+      const skin = parseInt(m[1], 10);
+      if (e.n >= ECO.maxInv || !skinInfo(skin)) continue;     // the game skips unknown skins too (a newer game: update ECO)
+      e.n++;
+      const seed = (parseInt(m[2], 10) || 0) & 0xffff;
+      const w = Math.fround(Math.min(1, Math.max(0, parseFloat(m[3]) || 0)));
+      const key = skin + ':' + seed + ':' + w;
+      const it = e.items.get(key);
+      if (it) it.c++; else e.items.set(key, { skin, w, c: 1 });
+    }
+  }
+  return e;
+}
+function ecoWorth(e) { let v = e.credits; for (const it of e.items.values()) v += itemValue(it.skin, it.w) * it.c; return v; }
+// chance of k or more hits when lam are expected (Poisson)
+function tailP(lam, k) {
+  if (k <= 0) return 1;
+  let term = Math.exp(-lam), sum = term;
+  for (let i = 1; i < k; i++) { term *= lam / i; sum += term; }
+  return Math.max(0, 1 - sum);
+}
+function tooLucky(st) { return (st.g >= 3 && tailP(st.eg, st.g) < 1e-6) || (st.r >= 4 && tailP(st.er, st.r) < 1e-6); }
+// gold / red items among some items, and how many of each a fair case opening would have given
+function luckOf(items, st) {
+  for (const it of items) {
+    const s = skinInfo(it.skin);
+    if (!s) continue;
+    const odds = ECO.tierOdds[s.tier];
+    st.eg += it.c * odds[4] / 100; st.er += it.c * odds[3] / 100;
+    if (s.rarity === 4) st.g += it.c; else if (s.rarity === 3) st.r += it.c;
+  }
+  return st;
+}
+// a save with the credits and skins put back to a new player's (level, rank and records stay)
+function resetEconomy(blob) {
+  const f = saveFields(blob);
+  for (let i = 2; i + 1 < f.length; i += 2) {
+    if (f[i] !== PROFILE_KEY) continue;
+    const lines = unescapeSave(f[i + 1]).split('\n').filter((l) => !/^(i |eqg |sig )/.test(l))
+      .map((l) => (/^credits /.test(l) ? 'credits ' + ECO.startCredits : (/^equip /.test(l) ? 'equip -1 -1' : l)));
+    f[i + 1] = escapeSave(lines.join('\n'));      // unsigned: the game checks it like an old save and signs it again
+  }
+  return f.join('\t');
+}
+const ECO_SOLD_KEEP = 600;       // sold skins remembered per account (an exact skin can't come out of a case twice)
+function freshEco(e, now, a) { return { credits: e.credits, items: e.items, t: now, a, eg: 0, er: 0, g: 0, r: 0, sold: [] }; }
+function ecoState(u) { const x = u.eco; return JSON.stringify({ t: x.t, a: Math.round(x.a), eg: x.eg, er: x.er, g: x.g, r: x.r, sold: x.sold }); }
+
+// a save from before (or without) a check: allowed if what it holds could be real
+function importOk(e) {
+  if (ecoWorth(e) > ECO_IMPORT_CAP) return 'more credits and skins than can be verified';
+  const st = luckOf(e.items.values(), { eg: 0, er: 0, g: 0, r: 0 });
+  if ((st.g >= 4 && tailP(st.eg, st.g) < 1e-9) || (st.r >= 6 && tailP(st.er, st.r) < 1e-9)) return 'far more rare skins than cases give';
+  return '';
+}
+// when an account comes online: the last accepted save is the baseline
+function ecoLoad(u, stateJson) {
+  if (!u.save) { u.eco = null; return; }               // a new account: its first save is checked as an import
+  const now = Date.now();
+  let st = null;
+  try { st = stateJson ? JSON.parse(stateJson) : null; } catch (e) { st = null; }
+  const e = parseEco(u.save);
+  if (st && typeof st.t === 'number') {
+    u.eco = { credits: e.credits, items: e.items, t: st.t, a: Number(st.a) || 0, eg: Number(st.eg) || 0, er: Number(st.er) || 0, g: st.g | 0, r: st.r | 0,
+      sold: Array.isArray(st.sold) ? st.sold.slice(-ECO_SOLD_KEEP).map(String) : [] };
+    return;
+  }
+  const why = importOk(e);
+  if (why) {
+    console.log('economy: ' + u.name + "'s saved credits and skins were reset (" + why + ')');
+    u.save = resetEconomy(u.save); u.saveDirty = true; u.saveAt = 0;
+    u.eco = freshEco(parseEco(u.save), now, ECO_BUCKET);
+  } else u.eco = freshEco(e, now, ECO_BUCKET);
+  u.ecoDirty = true;
+}
+// a new save from the game: { ok } or { ok: false, why, strike }
+function ecoCheck(u, blob) {
+  const now = Date.now();
+  const e = parseEco(blob);
+  if (!u.eco) {
+    const why = importOk(e);
+    if (why) return { ok: false, why, strike: false, reset: true };
+    u.eco = freshEco(e, now, ECO_BUCKET); u.ecoDirty = true;
+    return { ok: true };
+  }
+  const o = u.eco;
+  const allow = Math.min(ECO_BUCKET, o.a + ECO_RATE * Math.max(0, now - o.t) / 1000);
+  let cost = 0, sold = 0, back = false;
+  const added = [], soldKeys = [];
+  const soldBefore = new Set(o.sold || []);
+  for (const [k, it] of e.items) {
+    const had = o.items.get(k), n = it.c - (had ? had.c : 0);
+    if (n > 0) { cost += n * skinInfo(it.skin).price; added.push({ skin: it.skin, c: n }); if (soldBefore.has(k)) back = true; }
+  }
+  for (const [k, it] of o.items) {
+    const now2 = e.items.get(k), n = it.c - (now2 ? now2.c : 0);
+    if (n > 0) { sold += n * itemValue(it.skin, it.w); soldKeys.push(k); }
+  }
+  if (back) return { ok: false, why: 'a sold skin came back', strike: false };      // (or two devices out of step: no strike)
+  const earned = (e.credits - o.credits) + cost - sold;      // what playing must have paid out for this save to be real
+  if (earned > allow + ECO_SLACK)
+    return { ok: false, why: 'credits or skins that were not earned', detail: Math.round(earned) + ' credits needed, ' + Math.round(allow) + ' possible', strike: earned > allow + ECO_STRIKE };
+  const st = luckOf(added, { eg: o.eg, er: o.er, g: o.g, r: o.r });
+  if (tooLucky(st)) return { ok: false, why: 'far more rare skins than cases give', strike: true };
+  u.eco = { credits: e.credits, items: e.items, t: now, a: allow - Math.max(0, earned), eg: st.eg, er: st.er, g: st.g, r: st.r,
+    sold: (o.sold || []).concat(soldKeys).slice(-ECO_SOLD_KEEP) };
+  u.ecoDirty = true;
+  return { ok: true };
+}
+
 // anti-cheat strikes: the game flagged a match / edited memory / edited saves, or sent impossible stats.
 // At most one strike per connection per minute; AC_LIMIT strikes take the account off the leaderboards.
 function acStrike(c, u, kind, detail) {
@@ -519,7 +784,7 @@ function acStrike(c, u, kind, detail) {
   const cmds = [['HINCRBY', K.user(u.uid), 'acflags', 1]];
   if (u.acFlags >= AC_LIMIT && !u.flagged) {
     u.flagged = true;
-    cmds.push(['HSET', K.user(u.uid), 'flagged', '1'], ['ZREM', K.lb('kills'), u.uid], ['ZREM', K.lb('secs'), u.uid]);
+    cmds.push(['HSET', K.user(u.uid), 'flagged', '1'], ['ZREM', K.lb('kills'), u.uid], ['ZREM', K.lb('secs'), u.uid], ['ZREM', K.lb('credits'), u.uid]);
     lbCache.clear();
     console.log('anti-cheat: ' + u.name + ' flagged, removed from the leaderboards');
   }
@@ -533,8 +798,9 @@ async function adminUnflag(body) {
   const o = hashOf(await db1(['HGETALL', K.user(uid)]));
   const u = users.get(uid);
   const kills = (parseInt(o.kills || '0', 10) || 0), secs = (parseInt(o.secs || '0', 10) || 0);
+  const credits = u && u.eco ? u.eco.credits : parseEco(await db1(['GET', K.save(uid)]) || '').credits;
   await db([['HSET', K.user(uid), 'flagged', '0', 'acflags', 0], ['ZREM', K.lb('kills'), uid], ['ZREM', K.lb('secs'), uid],
-            ['ZINCRBY', K.lb('kills'), kills, uid], ['ZINCRBY', K.lb('secs'), secs, uid]]);
+            ['ZINCRBY', K.lb('kills'), kills, uid], ['ZINCRBY', K.lb('secs'), secs, uid], ['ZADD', K.lb('credits'), credits, uid]]);
   if (u) { u.flagged = false; u.acFlags = 0; }
   lbCache.clear();
   return { name: o.name, kills, secs };
@@ -543,9 +809,9 @@ async function adminUnflag(body) {
 // leaderboards: top 50, cached for 30 seconds
 const lbCache = new Map();
 async function leaderboard(c, board) {
-  if (board !== 'kills' && board !== 'secs') return;
+  if (board !== 'kills' && board !== 'secs' && board !== 'credits') return;
   const asker = c.uid ? users.get(c.uid) : null;          // your own numbers are always current on the board
-  if (asker && STAT_KEYS.some((k) => (asker.pend[k] || 0) >= 1)) await flushUser(asker).catch(() => {});
+  if (asker && (STAT_KEYS.some((k) => (asker.pend[k] || 0) >= 1) || asker.ecoDirty)) await flushUser(asker).catch(() => {});
   let top = lbCache.get(board);
   if (!top || top.at < Date.now() - 30000) {
     const flat = await db1(['ZREVRANGE', K.lb(board), 0, 49, 'WITHSCORES']) || [];
@@ -564,7 +830,7 @@ async function leaderboard(c, board) {
       const [rk, sc] = await db([['ZREVRANK', K.lb(board), c.uid], ['ZSCORE', K.lb(board), c.uid]]);
       if (rk !== null && rk !== undefined) { myRank = parseInt(rk, 10) + 1; myVal = Math.floor(parseFloat(sc) || 0); }
     }
-    if (u && !myRank) myVal = Math.floor(board === 'kills' ? totals(u).kills : totals(u).secs);
+    if (u && !myRank) myVal = Math.floor(board === 'kills' ? totals(u).kills : (board === 'secs' ? totals(u).secs : (u.eco ? u.eco.credits : 0)));
   }
   send(c, ['lbd', board, myRank, myVal, top.rows.map((r) => [r.name, r.v, isOwner(r.name) ? 1 : 0].join(',')).join(';')].join('|'));
 }
@@ -844,8 +1110,16 @@ function handle(c, msg) {
 
     case 'sv': {
       const u = c.uid ? users.get(c.uid) : null;
-      if (!u || rest.length > 48 * 1024) break;
-      if (u.save !== rest) { u.save = rest; if (!u.saveDirty) u.saveAt = Date.now(); u.saveDirty = true; }
+      if (!u || rest.length > 48 * 1024 || u.save === rest) break;
+      const r = ecoCheck(u, rest);
+      if (r.ok) { u.save = rest; if (!u.saveDirty) u.saveAt = Date.now(); u.saveDirty = true; break; }
+      console.log('economy: refused a save from ' + u.name + ': ' + r.why + (r.detail ? ' (' + r.detail + ')' : ''));
+      if (r.reset) {                 // a new account bringing in more than can be checked: it starts with a new player's credits and skins
+        u.save = resetEconomy(rest); u.saveDirty = true; u.saveAt = 0;
+        u.eco = freshEco(parseEco(u.save), Date.now(), ECO_BUCKET); u.ecoDirty = true;
+      }
+      if (r.strike) acStrike(c, u, 'save', r.why + (r.detail ? ' (' + r.detail + ')' : ''));
+      sendUser(u, 'svx|' + clean(r.why, 120) + '|' + u.save);
       break;
     }
 
@@ -987,6 +1261,8 @@ const server = http.createServer(async (req, res) => {
       if (url === '/api/signup') reply(res, 200, Object.assign({ ok: true }, await signup(ip, body.email, body.password, body.username)));
       else if (url === '/api/login') reply(res, 200, Object.assign({ ok: true }, await login(ip, body.email, body.password)));
       else if (url === '/api/delete') reply(res, 200, Object.assign({ ok: true }, await deleteAccount(ip, body.email, body.password)));
+      else if (url === '/api/verify') reply(res, 200, Object.assign({ ok: true }, await verifyCode(ip, body.email, body.code)));
+      else if (url === '/api/resend') reply(res, 200, Object.assign({ ok: true }, await resendCode(ip, body.email)));
       else if (url === '/api/logout') { if (body.token) await db1(['DEL', K.sess(hashToken(body.token))]); reply(res, 200, { ok: true }); }
       else if (url === '/api/admin/unflag') reply(res, 200, Object.assign({ ok: true }, await adminUnflag(body)));
       else reply(res, 404, { error: 'Not found.' });
@@ -999,7 +1275,8 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, Object.assign({ 'Content-Type': 'text/plain' }, CORS));
   res.end('CyberStrike server is running. Lobbies: ' + lobbies.size + ', players online: ' + clients.size + '\n' +
     (useUpstash ? 'Accounts are saved in Upstash.\n' : 'Accounts are saved in a local file. On Render, add UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN or accounts are wiped on every restart!\n') +
-    (OWNER ? 'Owner: @' + OWNER + '\n' : ''));
+    (OWNER ? 'Owner: @' + OWNER + '\n' : '') +
+    (mailOn ? 'Email verification is on.\n' : 'Email verification is off (set MAIL_FROM and BREVO_API_KEY to turn it on).\n'));
 });
 server.on('upgrade', (req, sock) => acceptSocket(req, sock));
 server.listen(PORT, () => console.log('CyberStrike server listening on port ' + PORT + (useUpstash ? ' (Upstash storage)' : ' (local file storage)')));
