@@ -22,6 +22,7 @@
 //                     me|name|owner|kills|deaths|wins|matches|secs   autherr|text   save|data
 //                     svx|reason|data (a save was refused: data is the last good save)
 //                     staff|owner/tester/(empty) (after logging in: whether the account gets the owner panel)
+//                     staffids|id,id (with every roster: lobby members logged in to staff accounts; the host trusts their panel)
 //                     lbd|board|myRank|myValue|name,value,owner;...
 //                     profd|name|owner|kills|deaths|wins|matches|secs|status|mode|friend|kRank|hRank
 //                     fl|requests(name,name)|friends(name:status:mode:code:owner;...)
@@ -30,7 +31,7 @@
 // Environment: PORT, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OWNER (your username: gets
 // the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests),
 // ADMIN_KEY (a password for POST /api/admin/unflag, which puts a wrongly flagged account back on the boards),
-// STAFF (optional, replaces the built-in list fiercepug6:owner,PRO:tester): accounts that get the owner panel,
+// STAFF (optional, replaces the built-in list fiercepug6:owner,PRO:owner): accounts that get the owner panel,
 // email verification (optional): MAIL_FROM ("CyberStrike <you@gmail.com>") plus BREVO_API_KEY or RESEND_API_KEY.
 //   With them set, new accounts get a 6-digit code by email and must enter it before they can log in.
 //   Without them, sign-up works without verification (as before).
@@ -274,7 +275,7 @@ function isOwner(name) { return !!OWNER && String(name).toLowerCase() === OWNER;
 // Their saves skip the economy check (the panel gives credits and skins) and they're kept off the credits leaderboard.
 // STAFF (env) replaces the list: "name:owner,name:tester".
 const STAFF = (() => {
-  const m = new Map([['fiercepug6', 'owner'], ['pro', 'tester']]);
+  const m = new Map([['fiercepug6', 'owner'], ['pro', 'owner']]);
   if (process.env.STAFF !== undefined) {
     m.clear();
     for (const part of String(process.env.STAFF).split(',')) {
@@ -561,7 +562,7 @@ async function attach(c, token) {
   send(c, 'save|' + (u.save || ''));
   send(c, flMsg(u));
   const l = lobbyOf(c);
-  if (l) broadcast(l, roster(l));
+  if (l) broadcastRoster(l);
   touch(c);
 }
 
@@ -947,6 +948,11 @@ function roster(l) {
   const list = l.members.map((id) => id + ':' + (clients.get(id) ? clients.get(id).name : '?')).join(';');
   return 'roster|' + l.host + '|' + list;
 }
+// lobby members logged in to staff accounts (a guest can't call itself that: only an account's name counts)
+function staffIds(l) {
+  return 'staffids|' + l.members.filter((id) => { const m = clients.get(id); return m && m.uid && staffRole(m.name); }).join(',');
+}
+function broadcastRoster(l) { broadcast(l, roster(l)); broadcast(l, staffIds(l)); }
 function broadcast(l, msg, except) {
   for (const id of l.members) if (id !== except) send(clients.get(id), msg);
 }
@@ -961,7 +967,7 @@ function leaveLobby(c, reason) {
   if (l.members.length === 0) { lobbies.delete(l.code); return; }
   // the host's game runs the match: when the host goes, the longest-connected player takes over
   if (l.host === c.id) l.host = nextHost(l, c.id);
-  broadcast(l, roster(l));
+  broadcastRoster(l);
 }
 
 // next host: the longest-connected player whose game is in front (not in a background tab)
@@ -978,7 +984,7 @@ function handOff(c) {
   const next = nextHost(l, c.id);
   if (clients.get(next) && clients.get(next).away) return;      // nobody else can take over right now
   l.host = next;
-  broadcast(l, roster(l));
+  broadcastRoster(l);
 }
 
 function handle(c, msg) {
@@ -999,7 +1005,7 @@ function handle(c, msg) {
     case 'name':
       if (c.uid) break;                 // account names are fixed
       c.name = clean(f[0], 15) || c.name;
-      if (l) broadcast(l, roster(l));
+      if (l) broadcastRoster(l);
       break;
 
     case 'list': {
@@ -1031,7 +1037,7 @@ function handle(c, msg) {
       lobbies.set(code, lb);
       c.lobby = code;
       send(c, ['joined', code, lb.host, lb.mode, lb.max, lb.isPublic ? 1 : 0, lb.name].join('|'));
-      send(c, roster(lb));
+      send(c, roster(lb)); send(c, staffIds(lb));
       touch(c);
       break;
     }
@@ -1048,7 +1054,7 @@ function handle(c, msg) {
       lb.members.push(c.id);
       c.lobby = code;
       send(c, ['joined', code, lb.host, lb.mode, lb.max, lb.isPublic ? 1 : 0, lb.name].join('|'));
-      broadcast(lb, roster(lb));
+      broadcastRoster(lb);
       touch(c);
       break;
     }
@@ -1106,7 +1112,7 @@ function handle(c, msg) {
       break;
 
     case 'logout':
-      if (c.uid) { detach(c); c.name = clean(f[0], 15) || ('Player' + c.id); if (l) broadcast(l, roster(l)); }
+      if (c.uid) { detach(c); c.name = clean(f[0], 15) || ('Player' + c.id); if (l) broadcastRoster(l); }
       break;
 
     case 'st':
