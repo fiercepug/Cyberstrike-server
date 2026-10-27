@@ -16,6 +16,7 @@
 //                     auth|token   logout   st|kills|deaths|wins|matches|secs   sv|save   lb|kills/secs/credits
 //                     prof|name   flist   fadd|name   facc|name   fdec|name   frem|name   inv|name
 //                     ac|kind|detail (the game's anti-cheat flagged something)   kick|id|reason (host only)
+//                     chat|a or t|dead|text   chat|qa or qt|dead|quickIndex   teams|id:team;id:team (host only, for team chat)
 //   server -> client: welcome|id   lobbies|entries   joined|code|hostId|mode|max|public|name
 //                     roster|hostId|id:name;id:name   started   ended   m|fromId|payload
 //                     err|text   closed|reason   pong|t
@@ -27,6 +28,12 @@
 //                     profd|name|owner|kills|deaths|wins|matches|secs|status|mode|friend|kRank|hRank
 //                     fl|requests(name,name)|friends(name:status:mode:code:owner;...)
 //                     fnote|text   invd|fromName|code|mode|lobbyName
+//                     cm|fromId|name|a/t/qa/qt|dead|text (a chat message)   chatx|text (a note about your own chat: rate limit, mute)
+//
+// Chat: the server puts the sender's own name on every message, limits it to 120 characters and 3 messages in
+// 5 seconds (more mutes the sender for 30 seconds), replaces bad words, and sends team chat only to the team
+// (the host tells it the teams every round). Guests can only send the quick messages. Staff can /mute name,
+// /unmute name and /log (the last messages of the lobby).
 //
 // Environment: PORT, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OWNER (your username: gets
 // the OWNER tag), DATA_FILE (local storage file), TCP_PORT (plain TCP for the automated tests),
@@ -66,6 +73,91 @@ const clients = new Map();          // id -> client
 function clean(s, max) {
   return String(s || '').replace(/[|;,:\n\r\t]/g, ' ').replace(/[^\x20-\x7e]/g, '').trim().slice(0, max);
 }
+// ---- chat
+const QUICK_COUNT = 10;               // the game's quick messages (sent as a number)
+const CHAT_RATE = 3, CHAT_WINDOW = 5000, CHAT_MUTE = 30000;
+const chatLog = [];                   // the last 200 messages, for staff (/log)
+// whole words that are replaced (after undoing letter tricks like 4 -> a, $ -> s and stretched letters)
+const BAD_WORDS = new Set(['fuck', 'fucker', 'fucking', 'fuk', 'fck', 'shit', 'bitch', 'cunt', 'dick', 'cock', 'pussy',
+  'asshole', 'bastard', 'whore', 'slut', 'wanker', 'twat', 'motherfucker', 'fag', 'retard', 'kys', 'spic']);
+// slurs: replaced wherever they appear in a word
+const BAD_PARTS = ['nigger', 'nigga', 'faggot', 'kike', 'chink', 'tranny', 'retarded', 'killyourself'];
+const LEET = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '8': 'b', '@': 'a', '$': 's', '!': 'i' };
+function normWord(w) {
+  let n = '';
+  for (const ch of w.toLowerCase()) n += LEET[ch] || ch;
+  return n.replace(/[^a-z]/g, '').replace(/(.)\1+/g, '$1');
+}
+function filterWords(text) {
+  const out = text.replace(/[A-Za-z0-9@$!]+/g, (w) => {
+    const n = normWord(w);
+    if (!n) return w;
+    const bad = BAD_WORDS.has(n) || BAD_PARTS.some((b) => n.includes(b.replace(/(.)\1+/g, '$1')));
+    return bad ? '*'.repeat(w.length) : w;
+  });
+  // a slur spread over words ("k y s", "n i g g e r")
+  const joined = normWord(text.replace(/[^A-Za-z0-9@$!]/g, ''));
+  if (BAD_PARTS.some((b) => joined.includes(b.replace(/(.)\1+/g, '$1')))) return '***';
+  return out;
+}
+function cleanChat(s) {
+  return String(s || '').replace(/[|\r\n\t]/g, ' ').replace(/[^\x20-\x7e]/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+function chatKey(c) { return c.uid ? 'u' + c.uid : 'c' + c.id; }
+function chatCommand(c, l, line) {
+  const [cmd, ...args] = line.slice(1).split(' ');
+  const who = args.join(' ').trim().toLowerCase();
+  const u = c.uid ? users.get(c.uid) : null;
+  if (!u || !staffRole(u.name)) { send(c, 'chatx|Only moderators can use /' + clean(cmd, 12) + '.'); return; }
+  if (cmd === 'log') {
+    const mine = chatLog.filter((e) => e.lobby === l.code).slice(-15);
+    for (const e of mine) send(c, 'chatx|' + new Date(e.t).toISOString().slice(11, 19) + ' ' + e.name + ': ' + e.text);
+    if (!mine.length) send(c, 'chatx|No messages in this lobby yet.');
+    return;
+  }
+  if (cmd !== 'mute' && cmd !== 'unmute') { send(c, 'chatx|Commands: /mute name, /unmute name, /log'); return; }
+  const tc = l.members.map((id) => clients.get(id)).find((x) => x && String(x.name).toLowerCase() === who);
+  if (!tc) { send(c, 'chatx|Nobody called ' + clean(who, 15) + ' in this lobby.'); return; }
+  l.chatMuted = l.chatMuted || new Set();
+  if (cmd === 'mute') l.chatMuted.add(chatKey(tc)); else l.chatMuted.delete(chatKey(tc));
+  broadcast(l, 'chatx|' + clean(tc.name, 15) + (cmd === 'mute' ? ' was muted by a moderator.' : ' can chat again.'));
+}
+function chatMessage(c, l, f) {
+  const scope = f[0];
+  if (!['a', 't', 'qa', 'qt'].includes(scope)) return;
+  const dead = f[1] === '1' ? 1 : 0;
+  const now = Date.now();
+  if (c.chatMuteUntil && now < c.chatMuteUntil) { send(c, 'chatx|Too many messages. You can chat again in ' + Math.ceil((c.chatMuteUntil - now) / 1000) + ' seconds.'); return; }
+  if (l.chatMuted && l.chatMuted.has(chatKey(c))) { send(c, 'chatx|A moderator muted you in this lobby.'); return; }
+  let text;
+  if (scope[0] === 'q') {
+    const k = parseInt(f[2], 10);
+    if (!(k >= 0 && k < QUICK_COUNT)) return;
+    text = String(k);
+  } else {
+    const raw = cleanChat(f.slice(2).join(' '));
+    if (raw.startsWith('/')) { chatCommand(c, l, raw); return; }
+    if (!c.uid) { send(c, 'chatx|Log in to type in chat. Guests can send quick messages with Z.'); return; }
+    text = filterWords(raw);
+    if (!text) return;
+  }
+  c.chatTimes = (c.chatTimes || []).filter((t) => now - t < CHAT_WINDOW);
+  if (c.chatTimes.length >= CHAT_RATE) {
+    c.chatMuteUntil = now + CHAT_MUTE; c.chatTimes = [];
+    send(c, 'chatx|Too many messages. You can chat again in 30 seconds.');
+    return;
+  }
+  c.chatTimes.push(now);
+  const msg = ['cm', c.id, clean(c.name, 15) || ('Player' + c.id), scope, dead, text].join('|');
+  const team = scope.endsWith('t') && l.teams ? l.teams.get(c.id) : undefined;
+  for (const id of l.members) {
+    if (team !== undefined && l.teams.get(id) !== team) continue;       // team chat: only that team (no teams known: everyone)
+    send(clients.get(id), msg);
+  }
+  chatLog.push({ t: now, lobby: l.code, name: clean(c.name, 15), text: scope[0] === 'q' ? '[quick ' + text + ']' : text });
+  if (chatLog.length > 200) chatLog.shift();
+}
+
 function cleanCode(s) { return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12); }
 function randomCode() {
   const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -1170,6 +1262,23 @@ function handle(c, msg) {
     case 'inv':
       invite(c, f[0]);
       break;
+
+    // ---- chat
+    case 'chat':
+      if (l) chatMessage(c, l, f);
+      break;
+
+    case 'teams': {                 // host: teams|id:team;id:team (1 T, 2 CT), sent every round, for team chat
+      if (!l || l.host !== c.id) break;
+      const m = new Map();
+      for (const part of rest.split(';')) {
+        const [a, b] = part.split(':');
+        const id = parseInt(a, 10), t = parseInt(b, 10);
+        if (l.members.includes(id) && (t === 1 || t === 2)) m.set(id, t);
+      }
+      l.teams = m;
+      break;
+    }
   }
 }
 
